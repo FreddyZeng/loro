@@ -142,20 +142,25 @@ doc in two steps:
    A container counts as reached in step 1 only through its header parent, so
    a forged header makes it a candidate; the full walk then rejects the
    inconsistency with `Err` instead of dropping a container that is still
-   referenced. Only keys that both steps leave unreached are removed. The
+   referenced. `export_shallow_snapshot_inner` logs that `Err` and exports the
+   root verbatim, as exporters before #1123 did: a root that cannot be judged
+   (documents hit by the #1161 family can hold one) must still be exportable,
+   and keeping everything drops nothing that is referenced. Only keys that
+   both steps leave unreached are removed. The
    filter protects placeholders and unknown subtrees that the walk cannot see,
    and the walk vetoes anything it still reaches. Never drop keys on either
    step's word alone.
 
 The overlay (>256 ops) branch still rejects unknown root keys, as before.
 
-The result (`None`, or the pruned bytes plus the removed keys) is memoized in
+The result (`None` for "reuse as-is", including the verbatim fallback, or the
+pruned bytes plus the removed keys) is memoized in
 `GcStore::pruned_root` because the cached root never changes. Only the first
 re-export of a root pays for the check. Repeated re-exports cost the same as
 before the fix, legacy roots are not re-encoded every time, and import is
 unaffected. `LoroDoc::fork` uses `encode_snapshot_inner_for_fork`
 (`CachedShallowRoot::Verbatim`): a fork copies the cached root verbatim, so it
-never fails the check or panics on an inconsistent root. Do not replace the
+never runs the check or panics on an inconsistent root. Do not replace the
 check with the latest state's alive set: tree metas that are dead at the latest
 version but alive inside the retained range would be lost.
 `legacy_*.bin` fixtures in the same test file pin both the dead-map drop and
@@ -163,6 +168,18 @@ tree-meta revival for such blobs. The forged-header and unknown-container
 regressions are `cached_root_*` unit tests in `shallow_snapshot.rs`.
 `crates/loro/tests/perf_shallow_reexport.rs` is the ignored release benchmark
 for first and repeated re-export and import.
+
+The pure TypeScript runtime (`loro-js`) uses the same retention rule when it
+rebuilds both states in `LoroDoc.#encodeShallowSnapshot`. The root state keeps
+`#retainedContainerKeys()` at the root: root containers (every mergeable
+container is one, as in Rust's `existing_retention_roots`, so a child hidden by
+a deleted or different-kind marker keeps its state), visible Map/List children,
+and every tree node's meta, including deleted nodes. The latest state
+additionally keeps containers alive at the latest version and containers whose
+creation id the root version does not include. `loro-js` always rebuilds the
+root state by replay instead of reusing its cached root store, so re-exporting
+an older blob at the same root also prunes it (the #1123 case). Tests are in
+`loro-js/tests/shallow-snapshot-deleted-containers.test.ts`.
 
 Two import-side pieces support revived tree nodes. `TreeOpGroup::record_shallow_root_state`
 seeds the tree diff cache with deleted nodes as well (directly deleted as

@@ -572,6 +572,46 @@ impl ContainerState for RichtextState {
         Diff::Text(ans)
     }
 
+    fn validate_diff(&self, diff: &InternalDiff) -> LoroResult<()> {
+        let InternalDiff::RichtextRaw(delta) = diff else {
+            unreachable!()
+        };
+
+        // Text items are addressed by entity index (style anchors included).
+        let mut cursor = 0usize;
+        let mut projected = match &self.state {
+            LazyLoad::Src(s) => s.entity_index,
+            LazyLoad::Dst(s) => s.len_entity(),
+        };
+        for span in delta.iter() {
+            match span {
+                loro_delta::DeltaItem::Retain { len, .. } => {
+                    cursor += len;
+                    if cursor > projected {
+                        return Err(LoroError::DecodeError(
+                            format!(
+                                "text diff retains {cursor} items but state only has {projected}"
+                            )
+                            .into_boxed_str(),
+                        ));
+                    }
+                }
+                loro_delta::DeltaItem::Replace { value, delete, .. } => {
+                    if cursor + delete > projected {
+                        return Err(LoroError::DecodeError(
+                            format!("text diff deletes {delete} at {cursor} but state only has {projected}")
+                                .into_boxed_str(),
+                        ));
+                    }
+                    projected = projected - delete + value.rle_len();
+                    cursor += value.rle_len();
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     fn apply_diff(&mut self, diff: InternalDiff, _ctx: DiffApplyContext) -> LoroResult<()> {
         self.update_version();
         let InternalDiff::RichtextRaw(richtext) = diff else {
@@ -1372,9 +1412,9 @@ mod snapshot {
             }
         }
 
-        if !open.is_empty() {
-            return Err(state_decode_error(format!("{CTX}: unclosed style mark")));
-        }
+        // Pairs still open are a version that holds a mark's `StyleStart` but not its
+        // `StyleEnd` (loro-dev/loro#1165). They style nothing yet, but the end may
+        // still arrive, so leave their values alone.
         if start_count != marks.len() {
             return Err(state_decode_error(format!("{CTX}: unused style mark")));
         }
@@ -1598,11 +1638,10 @@ mod snapshot {
                     "Decode richtext state failed: unused style mark",
                 ));
             }
-            if !id_to_style.is_empty() {
-                return Err(state_decode_error(
-                    "Decode richtext state failed: unclosed style mark",
-                ));
-            }
+            // A `StyleStart` without its `StyleEnd` is valid: a version can include the
+            // start op but not the end op (their counters are consecutive), and
+            // `checkout` keeps the lone start anchor the same way. The style applies
+            // to nothing until the end anchor arrives (loro-dev/loro#1165).
             text.state = LazyLoad::Src(loader);
             // NOTE: We need to ensure the invariance that the version id is always increased when the richtext state is changed
             // This is used to avoid the version_id to be the same as the previous zero version
@@ -1795,13 +1834,14 @@ mod snapshot {
 
         #[test]
         fn rejects_malformed_span_structures() {
-            // Start without a matching end.
+            // Start without a matching end is valid (loro-dev/loro#1165): a version can
+            // hold a mark's StyleStart but not its StyleEnd. It is left untouched.
             let unclosed = payload(
                 "",
                 vec![span(10, 0)],
                 vec![mark(LoroValue::Bool(true), richtext::ExpandType::After)],
             );
-            assert!(redact_dead_style_values(&unclosed, None).is_err());
+            assert!(redact_dead_style_values(&unclosed, None).unwrap().is_none());
 
             // End without a start. (An empty mark list short-circuits before
             // validation, so give it one mark to reach the scan.)

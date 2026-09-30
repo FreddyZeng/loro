@@ -14,7 +14,7 @@ use crate::{
     LoroValue,
 };
 use append_only_bytes::BytesSlice;
-use loro_common::PeerID;
+use loro_common::{PeerID, ID};
 use rustc_hash::FxHashMap;
 use std::fmt;
 use std::{
@@ -25,6 +25,27 @@ use std::{
 
 pub(crate) struct LoadAllFlag;
 type ParentResolver = dyn Fn(ContainerID) -> Option<ContainerID> + Send + Sync + 'static;
+/// Loads the change holding the op with the given ID, if the op log has it. Parsing a change
+/// registers the parent link of every container its ops create, and a normal container's ID is
+/// the ID of the op that created it. It answers [`CreatorOp::Corrupt`] if the op log has the
+/// change but cannot parse it. See `context/arena-parent-links.md`.
+type CreatorResolver = dyn Fn(&SharedArena, ID) -> CreatorOp + Send + Sync + 'static;
+
+/// What the op log's history knows about an op ID, answered by the [`CreatorResolver`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CreatorOp {
+    /// The change holding the op is parsed, so the parent of every container the op creates
+    /// is registered.
+    Loaded,
+    /// The history has no op with this ID: it was not received or committed yet, or it is
+    /// before the shallow root.
+    Absent,
+    /// A change block holds the op but cannot be decoded or parsed, so nothing is known about
+    /// the containers it creates. The op log records the block and reports it from the next
+    /// fallible entry point (import, export, checkout); the lookup itself answers like
+    /// `Absent` instead of panicking under the state lock.
+    Corrupt,
+}
 
 #[derive(Default)]
 struct ArenaContainers {
@@ -49,6 +70,14 @@ struct ArenaContainers {
     /// Locking: the resolver may read the state KV store. Code that loads from KV must snapshot
     /// KV data and release the KV lock before taking the arena lock.
     parent_resolver: Option<Arc<ParentResolver>>,
+    /// Set by the op log. Used after `parent_resolver` when a container's parent is still
+    /// unknown, e.g. the meta of a tree node that was never alive in a document loaded from a
+    /// snapshot, whose change blocks are parsed lazily.
+    ///
+    /// Locking: it takes the change store's locks and parses changes, which registers
+    /// containers in this arena, so it must be called without holding the arena lock. It runs
+    /// without the op log lock; see `ChangeStore::creator_resolver`.
+    creator_resolver: Option<Arc<CreatorResolver>>,
 }
 
 #[derive(Default)]
@@ -80,10 +109,26 @@ pub struct SharedArena {
 
 pub(crate) struct SharedArenaRollback {
     container_len: usize,
-    root_len: usize,
-    top_level_root_len: usize,
     values_len: usize,
     str: StrArenaCheckpoint,
+}
+
+/// How far the arena reached when something that refers into it was built, e.g. a parsed
+/// change block: it can only refer to containers, values, and text allocated before.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ArenaExtent {
+    containers: usize,
+    values: usize,
+    str_bytes: usize,
+}
+
+impl SharedArenaRollback {
+    /// Whether rolling back to this checkpoint keeps everything within `extent`.
+    pub(crate) fn keeps(&self, extent: ArenaExtent) -> bool {
+        extent.containers <= self.container_len
+            && extent.values <= self.values_len
+            && extent.str_bytes <= self.str.bytes_len()
+    }
 }
 
 #[derive(Debug)]
@@ -267,6 +312,8 @@ impl SharedArena {
                         root_c_idx: containers.root_c_idx.clone(),
                         top_level_root_c_idx: containers.top_level_root_c_idx.clone(),
                         parent_resolver: containers.parent_resolver.clone(),
+                        // It reads the source document's op log.
+                        creator_resolver: None,
                     }
                 }),
                 values: Mutex::new(self.inner.values.lock().clone()),
@@ -275,44 +322,59 @@ impl SharedArena {
         }
     }
 
+    /// See [`ArenaExtent`].
+    pub(crate) fn extent(&self) -> ArenaExtent {
+        ArenaExtent {
+            containers: self.inner.containers.read().container_idx_to_id.len(),
+            values: self.inner.values.lock().len(),
+            str_bytes: self.inner.str.lock().bytes_len(),
+        }
+    }
+
     pub(crate) fn checkpoint_for_rollback(&self) -> SharedArenaRollback {
         let containers = self.inner.containers.read();
         let container_len = containers.container_idx_to_id.len();
-        let root_len = containers.root_c_idx.len();
-        let top_level_root_len = containers.top_level_root_c_idx.len();
         drop(containers);
         let values_len = self.inner.values.lock().len();
         let str = self.inner.str.lock().checkpoint();
         SharedArenaRollback {
             container_len,
-            root_len,
-            top_level_root_len,
             values_len,
             str,
         }
     }
 
+    /// Call it through the op log's change store (`ChangeStore::rollback_arena` and friends),
+    /// which does it under the lock the creator resolver parses under and drops the parsed
+    /// changes that may refer to what this removes. See `context/arena-parent-links.md`.
+    ///
+    /// Container indices are never freed: a container registered since the checkpoint keeps
+    /// its index. `DocState` (store entries, caches) and handlers on other threads may hold
+    /// it, and a new container that reused it would inherit their state (loro-dev/loro#1164).
+    /// What the failed import may have told the arena about those containers is dropped: the
+    /// parent links of normal containers registered since the checkpoint, and links to them.
+    /// The resolvers find the links again from the kept history or the state. Roots keep their
+    /// links, which their IDs determine. Values and text are truncated; only parsed changes
+    /// refer to them. See `context/failed-import-arena-indices.md`.
     pub(crate) fn rollback(&self, checkpoint: SharedArenaRollback) {
-        let mut containers = self.inner.containers.write();
-        let removed_ids = containers
-            .container_idx_to_id
-            .split_off(checkpoint.container_len);
-        for id in removed_ids {
-            containers.container_id_to_idx.remove(&id);
+        {
+            let mut guard = self.inner.containers.write();
+            let containers = &mut *guard;
+            let container_len = checkpoint.container_len;
+            if containers.container_idx_to_id.len() > container_len {
+                let ids = &containers.container_idx_to_id;
+                containers.parents.retain(|child, parent| {
+                    let child_is_new = (child.to_index() as usize) >= container_len;
+                    let parent_is_new =
+                        parent.is_some_and(|p| (p.to_index() as usize) >= container_len);
+                    !((child_is_new || parent_is_new) && ids[child.to_index() as usize].is_normal())
+                });
+                // A cached depth may have been computed through a dropped link, also for the
+                // descendants of a container registered before the checkpoint. Roots and
+                // links that are kept give the same depth again.
+                containers.depth.fill(None);
+            }
         }
-        containers.depth.truncate(checkpoint.container_len);
-        containers.root_c_idx.truncate(checkpoint.root_len);
-        containers
-            .top_level_root_c_idx
-            .truncate(checkpoint.top_level_root_len);
-        containers.parents.retain(|child, parent| {
-            let child_is_kept = (child.to_index() as usize) < checkpoint.container_len;
-            let parent_is_kept = parent
-                .map(|p| (p.to_index() as usize) < checkpoint.container_len)
-                .unwrap_or(true);
-            child_is_kept && parent_is_kept
-        });
-        drop(containers);
 
         self.inner.values.lock().truncate(checkpoint.values_len);
         self.inner.str.lock().rollback(checkpoint.str);
@@ -405,6 +467,30 @@ impl SharedArena {
         self.inner.containers.write().set_parent(child, parent);
     }
 
+    /// Forget the parent links of the normal containers whose creating op is `peer`'s op at
+    /// `start_counter` or later, after such ops were discarded (a rolled back local
+    /// transaction). The next op at that id may create the container under another parent,
+    /// and until then the container has no parent, so it reads as deleted without being
+    /// cached as deleted. The registrations stay: other code may hold their indices. The
+    /// caller removes their state. See `context/apply-diff-atomicity.md`.
+    pub(crate) fn forget_parents_of_discarded_ops(&self, peer: PeerID, start_counter: Counter) {
+        let mut containers = self.inner.containers.write();
+        let discarded: Vec<ContainerIdx> = containers
+            .container_idx_to_id
+            .iter()
+            .enumerate()
+            .filter(|(_, id)| {
+                matches!(id, ContainerID::Normal { peer: p, counter, .. }
+                    if *p == peer && *counter >= start_counter)
+            })
+            .map(|(i, id)| ContainerIdx::from_index_and_type(i as u32, id.container_type()))
+            .collect();
+        for idx in discarded {
+            containers.parents.remove(&idx);
+            containers.depth[idx.to_index() as usize] = None;
+        }
+    }
+
     pub fn log_hierarchy(&self) {
         if cfg!(debug_assertions) {
             let containers = self.inner.containers.read();
@@ -433,33 +519,88 @@ impl SharedArena {
             });
     }
 
+    /// The parent of `child`, or `None` for a top-level root.
+    ///
+    /// Also `None` for a normal container that no op in the history creates (an ID from the
+    /// user that is not a container, an op not received yet, or a container that is not in
+    /// the state of a shallow document and whose creating op was trimmed): no path leads to
+    /// it, so it is treated like a container whose parent no longer holds it. A history that
+    /// has the op but cannot parse it panics instead (see [`CreatorResolver`]).
     pub fn get_parent(&self, child: ContainerIdx) -> Option<ContainerIdx> {
-        let (child_id, resolver) = {
+        match self.resolve_parent(child) {
+            Some(parent) => parent,
+            None => {
+                assert!(
+                    self.inner.containers.read().creator_resolver.is_some(),
+                    "InternalError: Parent is not registered"
+                );
+                None
+            }
+        }
+    }
+
+    /// Finds and registers `child`'s parent edge: the registered edge, else the state KV
+    /// (`parent_resolver`), else the change that created it (`creator_resolver`).
+    ///
+    /// Returns `Some(parent)` when the edge is known (`parent` is `None` for a top-level root)
+    /// and `None` when no source knows the container.
+    fn resolve_parent(&self, child: ContainerIdx) -> Option<Option<ContainerIdx>> {
+        let (child_id, resolver, creator_resolver) = {
             let containers = self.inner.containers.read();
             let child_id = containers.container_id(child).unwrap();
             if child_id.is_root() && !child_id.is_mergeable() {
                 // TODO: PERF: we can speed this up by use a special bit in ContainerIdx to indicate
                 // whether the target is a root container
-                return None;
+                return Some(None);
             }
 
             // Try fast path first
             if let Some(p) = containers.parents.get(&child).copied() {
-                return p;
+                return Some(p);
             }
 
-            // Fallback: try to resolve parent lazily via the resolver if provided.
-            (child_id, containers.parent_resolver.clone())
+            // Fallback: try to resolve parent lazily via the resolvers if provided.
+            (
+                child_id,
+                containers.parent_resolver.clone(),
+                containers.creator_resolver.clone(),
+            )
         };
         if let Some(resolver) = resolver {
             if let Some(parent_id) = resolver(child_id.clone()) {
                 let parent_idx = self.register_container(&parent_id);
                 self.set_parent(child, Some(parent_idx));
-                return Some(parent_idx);
+                return Some(Some(parent_idx));
             }
         }
 
-        panic!("InternalError: Parent is not registered")
+        if let (Some(resolver), ContainerID::Normal { peer, counter, .. }) =
+            (creator_resolver, &child_id)
+        {
+            return match resolver(self, ID::new(*peer, *counter)) {
+                // Registered unless the op does not create this container.
+                CreatorOp::Loaded => self.get_registered_parent(child),
+                CreatorOp::Absent | CreatorOp::Corrupt => None,
+            };
+        }
+
+        None
+    }
+
+    /// The index of a normal container that is not registered yet but that an op in the
+    /// history creates. Loading that op's change registers the container and its parent.
+    pub(crate) fn find_created_container(&self, id: &ContainerID) -> Option<ContainerIdx> {
+        if let Some(idx) = self.id_to_idx(id) {
+            return Some(idx);
+        }
+        let ContainerID::Normal { peer, counter, .. } = id else {
+            return None;
+        };
+        let resolver = self.inner.containers.read().creator_resolver.clone()?;
+        match resolver(self, ID::new(*peer, *counter)) {
+            CreatorOp::Loaded => self.id_to_idx(id),
+            CreatorOp::Absent | CreatorOp::Corrupt => None,
+        }
     }
 
     /// Return the parent edge already stored in the arena without invoking the lazy resolver.
@@ -517,6 +658,15 @@ impl SharedArena {
     #[inline]
     pub fn get_values(&self, range: Range<usize>) -> Vec<LoroValue> {
         (self.inner.values.lock()[range]).to_vec()
+    }
+
+    /// Whether the values in two ranges are equal, without cloning them.
+    pub(crate) fn value_slices_eq(&self, a: Range<usize>, b: Range<usize>) -> bool {
+        let values = self.inner.values.lock();
+        match (values.get(a), values.get(b)) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        }
     }
 
     /// Borrow the values in `range` without cloning them (unlike
@@ -707,6 +857,41 @@ impl SharedArena {
 
     // TODO: this can return a u16 directly now, since the depths are always valid
     pub(crate) fn get_depth(&self, container: ContainerIdx) -> Option<NonZeroU16> {
+        if let Some(d) = self.inner.containers.read().depth[container.to_index() as usize] {
+            return Some(d);
+        }
+
+        // `ArenaContainers::get_depth` runs under the arena lock, where the creator resolver
+        // cannot run, so resolve the missing parent links first.
+        let mut c = container;
+        // Every step goes one level up, and no valid chain is deeper than `u16::MAX`.
+        let mut steps = 0usize;
+        loop {
+            steps += 1;
+            assert!(
+                steps <= u16::MAX as usize + 1,
+                "InternalError: the parent links of {:?} form a cycle",
+                self.idx_to_id(container)
+            );
+            {
+                let containers = self.inner.containers.read();
+                if containers.depth[c.to_index() as usize].is_some() {
+                    break;
+                }
+                match containers.parents.get(&c).copied() {
+                    Some(Some(p)) => {
+                        c = p;
+                        continue;
+                    }
+                    Some(None) => break,
+                    None => {}
+                }
+            }
+            match self.resolve_parent(c) {
+                Some(Some(p)) => c = p,
+                _ => break,
+            }
+        }
         self.inner.containers.write().get_depth(container)
     }
 
@@ -784,6 +969,14 @@ impl SharedArena {
         self.inner.containers.write().parent_resolver =
             resolver.map(|f| Arc::new(f) as Arc<ParentResolver>);
     }
+
+    /// Register the op log's [`CreatorResolver`]. See `creator_resolver` in `ArenaContainers`.
+    pub(crate) fn set_creator_resolver<F>(&self, resolver: F)
+    where
+        F: Fn(&SharedArena, ID) -> CreatorOp + Send + Sync + 'static,
+    {
+        self.inner.containers.write().creator_resolver = Some(Arc::new(resolver));
+    }
 }
 
 #[cfg(test)]
@@ -849,6 +1042,67 @@ mod tests {
                 .contains(&top_root_idx),
             "the mergeable parent's grandparent (a top-level root) must be in the top-level list"
         );
+    }
+
+    /// The creator resolver parses changes, which registers containers in the arena, so
+    /// `get_parent` and `get_depth` must call it without holding the arena lock.
+    #[test]
+    fn creator_resolver_runs_outside_the_arena_lock() {
+        let arena = SharedArena::new();
+        let root = ContainerID::new_root("tree", ContainerType::Tree);
+        let meta = ContainerID::new_normal(ID::new(1, 3), ContainerType::Map);
+        let meta_for_resolver = meta.clone();
+        arena.set_creator_resolver(move |arena: &SharedArena, id: ID| {
+            assert_eq!(id, ID::new(1, 3));
+            // What parsing the change does: register the container and its parent.
+            let parent = arena.register_container(&root);
+            let child = arena.register_container(&meta_for_resolver);
+            arena.set_parent(child, Some(parent));
+            CreatorOp::Loaded
+        });
+
+        let meta_idx = arena.register_container(&meta);
+        assert_eq!(arena.get_depth(meta_idx).map(|d| d.get()), Some(2));
+        let root_idx = arena.id_to_idx(&ContainerID::new_root("tree", ContainerType::Tree));
+        assert_eq!(arena.get_parent(meta_idx), root_idx);
+    }
+
+    #[test]
+    fn a_container_that_no_op_creates_has_no_parent() {
+        for answer in [CreatorOp::Loaded, CreatorOp::Absent, CreatorOp::Corrupt] {
+            // `Loaded`: the op exists but creates something else.
+            let arena = SharedArena::new();
+            arena.set_creator_resolver(move |_: &SharedArena, _: ID| answer);
+            let id = ContainerID::new_normal(ID::new(1, 3), ContainerType::Map);
+            let idx = arena.register_container(&id);
+            assert_eq!(arena.get_parent(idx), None);
+            assert_eq!(arena.get_depth(idx), None);
+            let missing = ContainerID::new_normal(ID::new(1, 4), ContainerType::Text);
+            assert_eq!(arena.find_created_container(&missing), None);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "form a cycle")]
+    fn a_parent_cycle_fails_fast() {
+        let arena = SharedArena::new();
+        let a =
+            arena.register_container(&ContainerID::new_normal(ID::new(1, 0), ContainerType::Map));
+        let b =
+            arena.register_container(&ContainerID::new_normal(ID::new(1, 1), ContainerType::Map));
+        arena.set_parent(a, Some(b));
+        arena.set_parent(b, Some(a));
+        arena.get_depth(a);
+    }
+
+    /// Without an op log to ask, an unknown parent is still an internal error.
+    #[test]
+    #[should_panic(expected = "Parent is not registered")]
+    fn unknown_parent_without_a_creator_resolver_panics() {
+        let arena = SharedArena::new();
+        let idx =
+            arena.register_container(&ContainerID::new_normal(ID::new(1, 3), ContainerType::Map));
+        arena.get_parent(idx);
     }
 
     #[test]

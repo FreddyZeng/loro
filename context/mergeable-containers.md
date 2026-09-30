@@ -1,6 +1,6 @@
 # Mergeable Container Context
 
-Verified against code 2026-09-28.
+Verified against code 2026-09-29.
 
 Mergeable containers let two peers independently create the same child container
 under a map key and converge to one deterministic container id. The source of
@@ -123,6 +123,14 @@ full-state diff. So the mode is explicit:
   difference is written, keeping char/element/`TreeID` identity.
 - **UndoManager** composes remote events with `ContainerDiff::change()`, so a peer can still
   undo its edit after a remote undo re-activates the child.
+- **loro.js** mirrors this in `loro-js/src/runtime/document.ts`. `#completeDiffEntries`
+  adds full state for a re-activated child, both in `diff()` and in import/checkout events
+  (`#emit`). `revertTo` sets `#changesOnlyDiff`, which skips full state for mergeable
+  children. `applyDiff(diff, { fullState: true })` aligns through `#fullStateTargets` and
+  `#alignFullState`. `#validateDiffBatch` checks a hidden mergeable list's deltas against
+  its hidden length (re-ensuring resurfaces it). An event mirror passes `{ fullState: true }`
+  for `import`/`checkout` batches, as with loro-crdt (`ApplyDiffOptions.fullState`). Tests:
+  `loro-js/tests/mergeable-diff-alignment.test.ts`, with values taken from the Rust WASM build.
 
 Which batches may carry the flag:
 
@@ -174,7 +182,8 @@ flushed KV entry; the shallow alive walk retains them explicitly). An
 ensured-but-empty mergeable child has no KV entry of its own: full export omits
 it and importers resolve it from the parent map's marker. This is covered by
 `tests/mergeable_container/snapshot.rs`, including shallow snapshot tests for
-losing-kind state.
+losing-kind state. loro.js follows the same rule in `#retainedContainerKeys`
+(`loro-js/tests/shallow-snapshot-deleted-containers.test.ts`).
 
 Raw marker bytes are the wire/storage representation. Public read and diff
 surfaces should translate an active marker to a container value. APIs that expose
